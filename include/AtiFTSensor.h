@@ -23,6 +23,7 @@
 #include <boost/shared_ptr.hpp>
 #include <boost/bind.hpp>
 #include <Eigen/Eigen>
+#include <string>
 
 namespace ati_ft_sensor
 {
@@ -32,7 +33,9 @@ public:
   AtiFTSensor();
   ~AtiFTSensor();
 
-  bool initialize();
+  bool initialize(const std::string& sensor_ip = "192.168.1.1",
+                  uint16_t sensor_port = 49152,
+                  uint16_t local_port = 49152);
 
   void getStatus(uint32_t& rdt_seq, uint32_t& ft_seq, uint32_t& status);
   void getFT(double* force, double* torque);

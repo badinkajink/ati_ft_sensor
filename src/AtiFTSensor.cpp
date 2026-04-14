@@ -38,7 +38,9 @@ AtiFTSensor::AtiFTSensor()
   initialized_ = false;
 }
 
-bool AtiFTSensor::initialize()
+bool AtiFTSensor::initialize(const std::string& sensor_ip,
+                             uint16_t sensor_port,
+                             uint16_t local_port)
 {
   if(initialized_)
   {
@@ -62,11 +64,15 @@ bool AtiFTSensor::initialize()
   memset(&remote_address_, 0, sizeof(struct sockaddr_in));
   local_address_.sin_family = AF_INET;
   local_address_.sin_addr.s_addr = INADDR_ANY;
-  local_address_.sin_port = htons(49152);
+  local_address_.sin_port = htons(local_port);
 
   remote_address_.sin_family = AF_INET;
-  inet_aton("192.168.4.1",&(remote_address_.sin_addr));
-  remote_address_.sin_port = htons(49152);
+  if(inet_aton(sensor_ip.c_str(), &(remote_address_.sin_addr)) == 0)
+  {
+    printf("invalid sensor IP address: %s\n", sensor_ip.c_str());
+    return false;
+  }
+  remote_address_.sin_port = htons(sensor_port);
 
   socket_ = rt_dev_socket(AF_INET, SOCK_DGRAM, 0);
   if(socket_<0)
@@ -85,7 +91,10 @@ bool AtiFTSensor::initialize()
     return false;
   }
 
-  printf("created sockets\n");
+  printf("created sockets (sensor=%s:%u, local_port=%u)\n",
+         sensor_ip.c_str(),
+         static_cast<unsigned>(sensor_port),
+         static_cast<unsigned>(local_port));
 
 #ifdef XENOMAI
   if(rt_pipe_create(&stream_pipe_, "ati_ft_stream",P_MINOR_AUTO,0))
