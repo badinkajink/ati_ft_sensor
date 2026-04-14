@@ -1,0 +1,18 @@
+{
+  "last_ip": "192.168.1.1",
+  "last_mac": "",
+  "local_port": "49152",
+  "counts_force": "1000000.0",
+  "counts_torque": "1000000.0",
+  "show_history": true,
+  "history_auto_scale": true,
+  "history_duration": "10",
+  "visible_axes": {
+    "Fx": true,
+    "Fy": true,
+    "Fz": true,
+    "Tx": true,
+    "Ty": true,
+    "Tz": true
+  }
+}

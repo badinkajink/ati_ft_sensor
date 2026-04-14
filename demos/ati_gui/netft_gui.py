@@ -12,12 +12,15 @@ Features:
 from __future__ import annotations
 
 import ipaddress
+import json
+import os
 import queue
 import socket
 import struct
 import threading
 import time
 import tkinter as tk
+from collections import deque
 from dataclasses import dataclass
 from tkinter import messagebox, ttk
 
@@ -40,6 +43,17 @@ TAG_DELAY_MULT = 0xF2
 RDT_CMD_STOP = 0x0000
 RDT_CMD_SINGLE = 0x0002
 RDT_CMD_TARE = 0x0042
+
+SETTINGS_FILE = "ATINetFTDemoOptions.json"
+AXES = ("Fx", "Fy", "Fz", "Tx", "Ty", "Tz")
+AXIS_COLORS = {
+    "Fx": "#0d47a1",
+    "Fy": "#1b5e20",
+    "Fz": "#bf360c",
+    "Tx": "#4a148c",
+    "Ty": "#006064",
+    "Tz": "#5d4037",
+}
 
 
 @dataclass
@@ -168,19 +182,26 @@ class NetFTGui(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("ATI Net F/T Demo (Tkinter)")
-        self.geometry("900x560")
+        self.geometry("980x680")
+        self.minsize(900, 620)
 
         self.msg_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.stop_event = threading.Event()
         self.reader_thread: threading.Thread | None = None
         self.client: NetFTRdtClient | None = None
 
-        self.ip_var = tk.StringVar(value="192.168.1.1")
-        self.local_port_var = tk.StringVar(value="49152")
-        self.counts_force_var = tk.StringVar(value="1000000")
-        self.counts_torque_var = tk.StringVar(value="1000000")
+        self._settings = self._load_settings()
+
+        self.ip_var = tk.StringVar(value=self._settings.get("last_ip", "192.168.1.1"))
+        self.local_port_var = tk.StringVar(value=str(self._settings.get("local_port", 49152)))
+        self.counts_force_var = tk.StringVar(value=str(self._settings.get("counts_force", 1000000.0)))
+        self.counts_torque_var = tk.StringVar(value=str(self._settings.get("counts_torque", 1000000.0)))
         self.status_var = tk.StringVar(value="Disconnected")
         self.seq_var = tk.StringVar(value="RDT seq: - | FT seq: - | Status: -")
+        self.history_enabled_var = tk.BooleanVar(value=bool(self._settings.get("show_history", True)))
+        self.auto_scale_var = tk.BooleanVar(value=bool(self._settings.get("history_auto_scale", True)))
+        self.history_duration_var = tk.StringVar(value=str(self._settings.get("history_duration", 10)))
+        self.last_mac_address = self._settings.get("last_mac", "")
 
         self.ft_vars = {
             "Fx": tk.StringVar(value="0.000"),
@@ -191,7 +212,21 @@ class NetFTGui(tk.Tk):
             "Tz": tk.StringVar(value="0.000"),
         }
 
+        self.axis_visible_vars: dict[str, tk.BooleanVar] = {
+            axis: tk.BooleanVar(value=True) for axis in AXES
+        }
+        if isinstance(self._settings.get("visible_axes"), dict):
+            for axis, enabled in self._settings["visible_axes"].items():
+                if axis in self.axis_visible_vars:
+                    self.axis_visible_vars[axis].set(bool(enabled))
+
+        self.history: dict[str, deque[tuple[float, float]]] = {
+            axis: deque() for axis in AXES
+        }
+
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.after(250, self._redraw_history_plot)
         self.after(100, self._drain_queue)
 
     def _build_ui(self) -> None:
@@ -218,6 +253,25 @@ class NetFTGui(tk.Tk):
         ttk.Label(top, text="Counts/Torque:").grid(row=1, column=4, sticky="e", pady=(8, 0))
         ttk.Entry(top, textvariable=self.counts_torque_var, width=10).grid(row=1, column=5, sticky="w", pady=(8, 0))
 
+        ttk.Checkbutton(
+            top,
+            text="Show History",
+            variable=self.history_enabled_var,
+            command=self._toggle_history_view,
+        ).grid(row=2, column=0, sticky="w", pady=(8, 0))
+
+        ttk.Label(top, text="Duration (s):").grid(row=2, column=1, sticky="e", pady=(8, 0))
+        ttk.Entry(top, textvariable=self.history_duration_var, width=8).grid(
+            row=2, column=2, sticky="w", pady=(8, 0)
+        )
+
+        ttk.Checkbutton(
+            top,
+            text="Auto Scale",
+            variable=self.auto_scale_var,
+            command=self._save_settings,
+        ).grid(row=2, column=3, sticky="w", pady=(8, 0))
+
         middle = ttk.Frame(root)
         middle.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
 
@@ -243,11 +297,31 @@ class NetFTGui(tk.Tk):
 
         ttk.Label(grid, textvariable=self.seq_var).grid(row=7, column=0, columnspan=2, sticky="w", pady=5)
 
+        history_frame = ttk.LabelFrame(root, text="History View")
+        history_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        self.history_frame = history_frame
+
+        axis_controls = ttk.Frame(history_frame)
+        axis_controls.pack(fill=tk.X, padx=8, pady=(8, 0))
+        ttk.Label(axis_controls, text="Visible Axes:").pack(side=tk.LEFT)
+        for axis in AXES:
+            ttk.Checkbutton(
+                axis_controls,
+                text=axis,
+                variable=self.axis_visible_vars[axis],
+                command=self._save_settings,
+            ).pack(side=tk.LEFT, padx=(8, 0))
+
+        self.history_canvas = tk.Canvas(history_frame, bg="white", height=220)
+        self.history_canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
         messages = ttk.LabelFrame(root, text="Messages")
         messages.pack(fill=tk.BOTH, expand=False, pady=(10, 0))
 
         self.msg_text = tk.Text(messages, height=8, wrap=tk.WORD)
         self.msg_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        self._toggle_history_view()
 
     def log(self, text: str) -> None:
         now = time.strftime("%H:%M:%S")
@@ -273,6 +347,10 @@ class NetFTGui(tk.Tk):
         line = self.devices_list.get(sel[0])
         ip = line.split()[0].replace("IP=", "")
         self.ip_var.set(ip)
+        if "MAC=" in line:
+            mac_part = line.split("MAC=")[1].split()[0]
+            self.last_mac_address = mac_part
+        self._save_settings()
 
     def on_connect(self) -> None:
         if self.reader_thread is not None:
@@ -293,6 +371,7 @@ class NetFTGui(tk.Tk):
             return
 
         self.stop_event.clear()
+        self._save_settings()
 
         def reader() -> None:
             self.client = NetFTRdtClient(ip=ip, local_port=local_port, timeout=0.75)
@@ -317,6 +396,7 @@ class NetFTGui(tk.Tk):
     def on_disconnect(self) -> None:
         self.stop_event.set()
         self.reader_thread = None
+        self._save_settings()
 
     def on_tare(self) -> None:
         if self.client is None:
@@ -342,14 +422,175 @@ class NetFTGui(tk.Tk):
         c_force = self._safe_float(self.counts_force_var.get(), 1_000_000.0)
         c_torque = self._safe_float(self.counts_torque_var.get(), 1_000_000.0)
 
-        self.ft_vars["Fx"].set(f"{fx / c_force:.6f}")
-        self.ft_vars["Fy"].set(f"{fy / c_force:.6f}")
-        self.ft_vars["Fz"].set(f"{fz / c_force:.6f}")
-        self.ft_vars["Tx"].set(f"{tx / c_torque:.6f}")
-        self.ft_vars["Ty"].set(f"{ty / c_torque:.6f}")
-        self.ft_vars["Tz"].set(f"{tz / c_torque:.6f}")
+        scaled = {
+            "Fx": fx / c_force,
+            "Fy": fy / c_force,
+            "Fz": fz / c_force,
+            "Tx": tx / c_torque,
+            "Ty": ty / c_torque,
+            "Tz": tz / c_torque,
+        }
+
+        for axis, value in scaled.items():
+            self.ft_vars[axis].set(f"{value:.6f}")
+
+        now = time.monotonic()
+        for axis, value in scaled.items():
+            self.history[axis].append((now, value))
+
+        self._trim_history(now)
 
         self.seq_var.set(f"RDT seq: {rdt_seq} | FT seq: {ft_seq} | Status: 0x{status:08x}")
+
+    def _history_duration_seconds(self) -> float:
+        try:
+            duration = float(self.history_duration_var.get())
+            if duration <= 0:
+                return 10.0
+            return min(duration, 600.0)
+        except ValueError:
+            return 10.0
+
+    def _trim_history(self, now: float | None = None) -> None:
+        if now is None:
+            now = time.monotonic()
+        window = self._history_duration_seconds()
+        cutoff = now - window
+        for axis in AXES:
+            data = self.history[axis]
+            while data and data[0][0] < cutoff:
+                data.popleft()
+
+    def _toggle_history_view(self) -> None:
+        if self.history_enabled_var.get():
+            self.history_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        else:
+            self.history_frame.pack_forget()
+        self._save_settings()
+
+    def _settings_path(self) -> str:
+        return os.path.join(os.path.dirname(__file__), SETTINGS_FILE)
+
+    def _load_settings(self) -> dict[str, object]:
+        try:
+            with open(self._settings_path(), "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+                if isinstance(data, dict):
+                    return data
+        except (OSError, json.JSONDecodeError):
+            pass
+        return {}
+
+    def _save_settings(self) -> None:
+        data = {
+            "last_ip": self.ip_var.get().strip(),
+            "last_mac": self.last_mac_address,
+            "local_port": self.local_port_var.get().strip(),
+            "counts_force": self.counts_force_var.get().strip(),
+            "counts_torque": self.counts_torque_var.get().strip(),
+            "show_history": self.history_enabled_var.get(),
+            "history_auto_scale": self.auto_scale_var.get(),
+            "history_duration": self.history_duration_var.get().strip(),
+            "visible_axes": {axis: var.get() for axis, var in self.axis_visible_vars.items()},
+        }
+        try:
+            with open(self._settings_path(), "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2)
+        except OSError:
+            # Keep GUI responsive even when settings cannot be saved.
+            pass
+
+    def _redraw_history_plot(self) -> None:
+        if not hasattr(self, "history_canvas"):
+            return
+
+        canvas = self.history_canvas
+        width = max(canvas.winfo_width(), 200)
+        height = max(canvas.winfo_height(), 120)
+        canvas.delete("all")
+
+        left_pad = 48
+        right_pad = 16
+        top_pad = 12
+        bottom_pad = 24
+        plot_w = max(width - left_pad - right_pad, 40)
+        plot_h = max(height - top_pad - bottom_pad, 40)
+
+        canvas.create_rectangle(
+            left_pad,
+            top_pad,
+            left_pad + plot_w,
+            top_pad + plot_h,
+            outline="#b0bec5",
+            width=1,
+        )
+
+        now = time.monotonic()
+        self._trim_history(now)
+        window = self._history_duration_seconds()
+        x0 = now - window
+
+        y_values: list[float] = []
+        for axis in AXES:
+            if self.axis_visible_vars[axis].get():
+                y_values.extend(value for _, value in self.history[axis])
+
+        if not y_values:
+            canvas.create_text(width / 2, height / 2, text="No data yet", fill="#607d8b")
+            self.after(250, self._redraw_history_plot)
+            return
+
+        y_min = min(y_values)
+        y_max = max(y_values)
+        if self.auto_scale_var.get():
+            if y_min == y_max:
+                span = max(abs(y_min), 1.0)
+                y_min -= span * 0.2
+                y_max += span * 0.2
+        else:
+            max_abs = max(abs(y_min), abs(y_max), 1.0)
+            y_min, y_max = -max_abs, max_abs
+
+        span_y = max(y_max - y_min, 1e-9)
+
+        canvas.create_text(16, top_pad, text=f"{y_max:.3f}", anchor="w", fill="#455a64")
+        canvas.create_text(16, top_pad + plot_h, text=f"{y_min:.3f}", anchor="w", fill="#455a64")
+        canvas.create_text(left_pad + plot_w, top_pad + plot_h + 14, text="now", anchor="e", fill="#455a64")
+        canvas.create_text(left_pad, top_pad + plot_h + 14, text=f"-{window:.1f}s", anchor="w", fill="#455a64")
+
+        for axis in AXES:
+            if not self.axis_visible_vars[axis].get():
+                continue
+            points = []
+            for ts, value in self.history[axis]:
+                x = left_pad + ((ts - x0) / window) * plot_w
+                y = top_pad + (1.0 - ((value - y_min) / span_y)) * plot_h
+                points.extend([x, y])
+            if len(points) >= 4:
+                canvas.create_line(*points, fill=AXIS_COLORS[axis], width=2)
+
+        legend_x = left_pad + 6
+        legend_y = top_pad + 6
+        for axis in AXES:
+            if not self.axis_visible_vars[axis].get():
+                continue
+            canvas.create_rectangle(
+                legend_x,
+                legend_y,
+                legend_x + 10,
+                legend_y + 10,
+                fill=AXIS_COLORS[axis],
+                outline="",
+            )
+            canvas.create_text(legend_x + 14, legend_y + 5, text=axis, anchor="w")
+            legend_x += 54
+
+        self.after(250, self._redraw_history_plot)
+
+    def on_close(self) -> None:
+        self.stop_event.set()
+        self._save_settings()
+        self.destroy()
 
     def _drain_queue(self) -> None:
         while True:
@@ -370,6 +611,8 @@ class NetFTGui(tk.Tk):
             elif kind == "status":
                 self.status_var.set(payload)
                 self.log(str(payload))
+                if str(payload) == "Disconnected":
+                    self.reader_thread = None
             elif kind == "error":
                 self.status_var.set("Error")
                 self.log(str(payload))
